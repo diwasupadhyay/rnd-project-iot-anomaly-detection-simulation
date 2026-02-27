@@ -1,0 +1,28 @@
+# Virtual environment
+venv/
+
+# Dataset (3GB - too large for git)
+data/raw/
+
+# Processed numpy arrays (500MB+ - regenerate with preprocess.py)
+data/processed/
+
+# Model weights (regenerate with train.py)
+models/saved/
+
+# Auto-generated plots
+data/eda_plots/
+models/plots/
+simulation/logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
