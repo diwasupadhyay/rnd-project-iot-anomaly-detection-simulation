@@ -5,13 +5,21 @@ Real-time network anomaly detection using CNN-LSTM + LLM analysis.
 Run:  streamlit run dashboard/app.py
 """
 
+import sys, os, time, threading
+from datetime import datetime
+from collections import deque
+
+# Load .env BEFORE any module imports that read env vars
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"), override=False)
+except ImportError:
+    pass
+
 import streamlit as st
 import numpy as np
 import pandas as pd
 import torch
-import sys, os, time, threading
-from datetime import datetime
-from collections import deque
 import plotly.graph_objects as go
 import joblib
 
@@ -409,8 +417,20 @@ def init():
             st.session_state[k] = v
 
 init()
-model = load_model()
-feature_names = load_feature_names()
+
+try:
+    model = load_model()
+except Exception as e:
+    st.error(f"❌ Failed to load model: {e}")
+    st.info("Ensure `models/saved/best_model.pth` exists. Run `python models/train.py` first.")
+    st.stop()
+
+try:
+    feature_names = load_feature_names()
+except Exception as e:
+    st.error(f"❌ Failed to load feature names: {e}")
+    st.stop()
+
 scaler = load_scaler()
 
 
@@ -431,8 +451,8 @@ with st.sidebar:
 
     st.markdown("---")
     enable_llm = st.toggle("LLM Analysis", value=True)
-    llm_min_conf = st.slider("LLM min confidence %", 85, 99, 92, 1)
-    llm_cooldown = st.slider("LLM cooldown (sec)", 10, 180, 45, 5)
+    llm_min_conf = st.slider("LLM min confidence %", 85, 99, 90, 1)
+    llm_cooldown = st.slider("LLM cooldown (sec)", 5, 120, 20, 5)
     st.markdown("---")
 
     if source_mode == "Live Simulation":
@@ -455,7 +475,7 @@ with st.sidebar:
             )
 
         st.markdown("---")
-        flow_speed = st.slider("Flow interval (s)", 0.1, 0.8, 0.3, 0.05)
+        flow_speed = st.slider("Flow interval (s)", 0.2, 1.0, 0.5, 0.05)
         st.markdown("---")
 
         c1, c2 = st.columns(2)
@@ -1102,4 +1122,4 @@ if st.session_state.running:
                     threading.Thread(target=_run_llm, daemon=True).start()
 
         time.sleep(flow_speed)
-        st.rerun()  # ← always last
+        st.rerun()
