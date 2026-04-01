@@ -1,0 +1,38 @@
+Variance
+ack_flag_number
+Protocol Type
+TCP
+HTTPS
+Duration
+syn_count
+Min
+rst_count
+Std
+Radius
+urg_count
+Max
+flow_duration
+UDP
+Covariance
+Header_Length
+Magnitue
+HTTP
+ack_count
+AVG
+Tot size
+Tot sum
+psh_flag_number
+Rate
+Srate
+DNS
+IPv
+LLC
+fin_count
+ARP
+Number
+Weight
+IAT
+ICMP
+syn_flag_number
+rst_flag_number
+fin_flag_number

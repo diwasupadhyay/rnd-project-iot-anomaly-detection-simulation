@@ -16,6 +16,7 @@ import os
 BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR  = os.path.join(BASE_DIR, "data", "processed")
 FEAT_PATH = os.path.join(DATA_DIR, "feature_names.txt")
+DEMO_POOL_PATH = os.path.join(DATA_DIR, "demo_pool.npz")
 
 # ── Load feature names ────────────────────────────────────────────────────────
 def get_feature_names():
@@ -36,16 +37,23 @@ def _load_pool():
     if _pools:
         return   # already loaded
 
-    print("📦  Loading real data pool for simulation...")
-    X = np.load(os.path.join(DATA_DIR, "X_test.npy"))   # (N, 10, 38)
-    y = np.load(os.path.join(DATA_DIR, "y_test.npy"))   # (N,)
+    if os.path.exists(DEMO_POOL_PATH):
+        print("📦  Loading compact demo pool for simulation...")
+        demo = np.load(DEMO_POOL_PATH)
+        _pools[0] = demo["normal"].astype(np.float32)
+        _pools[1] = demo["ddos"].astype(np.float32)
+        _pools[2] = demo["botnet"].astype(np.float32)
+    else:
+        print("📦  Loading full test pool for simulation...")
+        X = np.load(os.path.join(DATA_DIR, "X_test.npy"))   # (N, 10, 38)
+        y = np.load(os.path.join(DATA_DIR, "y_test.npy"))   # (N,)
 
-    # Use the LAST timestep of each window as a single feature vector
-    X_flat = X[:, -1, :]   # (N, 38)
+        # Use the LAST timestep of each window as a single feature vector
+        X_flat = X[:, -1, :]   # (N, 38)
 
-    for cls in [0, 1, 2]:
-        mask = y == cls
-        _pools[cls] = X_flat[mask]
+        for cls in [0, 1, 2]:
+            mask = y == cls
+            _pools[cls] = X_flat[mask]
 
     label_map = {0: "Normal", 1: "DDoS", 2: "Botnet"}
     for cls, name in label_map.items():

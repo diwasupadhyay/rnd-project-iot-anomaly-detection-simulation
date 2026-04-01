@@ -5,10 +5,18 @@ venv/
 data/raw/
 
 # Processed numpy arrays (500MB+ - regenerate with preprocess.py)
-data/processed/
+data/processed/*
 
 # Model weights (regenerate with train.py)
-models/saved/
+models/saved/*
+
+# Deploy/showcase artifacts that should be tracked
+!models/saved/
+!models/saved/best_model.pth
+!data/processed/
+!data/processed/feature_names.txt
+!data/processed/scaler.pkl
+!data/processed/demo_pool.npz
 
 # Auto-generated plots
 data/eda_plots/

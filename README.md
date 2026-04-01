@@ -1,8 +1,8 @@
 # 🛡️ IoT Anomaly Shield — Real-Time Network Threat Detection
 
-**CNN-LSTM Deep Learning + Local LLM (Ollama LLaMA 3.2:3b)**
+**CNN-LSTM Deep Learning + LLM (Gemini 2.5 Flash / Ollama)**
 
-Detects DDoS attacks and Mirai botnet infections in IoT network traffic in real-time using a hybrid CNN-LSTM model, with live AI-powered incident analysis via a locally-hosted LLM.
+Detects DDoS attacks and Mirai botnet infections in IoT network traffic in real-time using a hybrid CNN-LSTM model, with live AI-powered incident analysis via Gemini API (deployment) or Ollama (local).
 
 ---
 
@@ -12,7 +12,7 @@ Detects DDoS attacks and Mirai botnet infections in IoT network traffic in real-
 |---|---|
 | **Dataset** | CICIoT2023 — 169 CSV files (~3 GB, 507K samples) |
 | **Model** | CNN-LSTM hybrid (218K params, 99.92% accuracy) |
-| **LLM** | Ollama — LLaMA 3.2:3b (local, offline, streaming) |
+| **LLM** | Gemini 2.5 Flash (deploy) or Ollama LLaMA 3.2:3b (local) |
 | **Dashboard** | Streamlit + Plotly (dark theme, real-time) |
 | **Detection** | 3 classes: Normal, DDoS (SYN/UDP), Botnet (Mirai) |
 | **Language** | Python 3.11+ / PyTorch 2.x (CUDA supported) |
@@ -22,7 +22,8 @@ Detects DDoS attacks and Mirai botnet infections in IoT network traffic in real-
 ## Features
 
 - **Real-time classification** — Sliding-window CNN-LSTM classifies flows every ~0.3s
-- **Live streaming LLM analysis** — Token-by-token incident reports via Ollama
+- **Live streaming LLM analysis** — Token-chunk incident reports via Gemini or Ollama
+- **CSV Upload testing mode** — Run inference on your own traffic CSV files
 - **Network health monitoring** — Dynamic health score with threat severity
 - **Professional SOC dashboard** — Dark theme, live charts, probability visualization
 - **Attack simulation** — Multi-phase scenarios using real CICIoT2023 data vectors
@@ -34,7 +35,7 @@ Detects DDoS attacks and Mirai botnet infections in IoT network traffic in real-
 
 - Python 3.11 or 3.12
 - NVIDIA GPU with CUDA (recommended, CPU also works)
-- [Ollama](https://ollama.com/download) installed and running
+- Gemini API key (recommended for deployment) or [Ollama](https://ollama.com/download) for local mode
 - ~6 GB free disk space
 
 ---
@@ -53,10 +54,13 @@ source venv/bin/activate        # Linux/Mac
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Pull LLM model (one time, ~2 GB download)
-ollama pull llama3.2:3b
+# 4. Configure environment variables
+# Windows PowerShell:
+copy .env.example .env
+# then set GEMINI_API_KEY in .env (or in your deployment platform env settings)
 
-# 5. Start Ollama server (keep running in background)
+# 5. Optional local LLM mode (instead of Gemini)
+ollama pull llama3.2:3b
 ollama serve
 ```
 
@@ -93,6 +97,7 @@ python detection/realtime_pipeline.py    # Console-based live detection demo
 ```bash
 streamlit run dashboard/app.py
 # Open http://localhost:8501 → press ▶ Start in sidebar
+# For custom data: switch Input Source to CSV Upload and upload your CSV
 ```
 
 ---
@@ -125,7 +130,7 @@ iot-anomaly-detection/
 │   ├── detector.py           ← File-based inference on CSV logs
 │   └── realtime_pipeline.py  ← Console real-time detection pipeline
 ├── llm/
-│   └── interpreter.py        ← Ollama LLM wrapper (streaming)
+│   └── interpreter.py        ← Gemini/Ollama LLM wrapper
 ├── requirements.txt
 ├── METHODOLOGY.md
 └── README.md
@@ -185,6 +190,7 @@ Output: [Normal, DDoS, Botnet] probabilities
 - **Active threat banner** with pulsing animation
 - **AI analysis cards** with live LLM streaming (token-by-token)
 - **Attack event log** table with timestamps and confidence
+- **CSV Upload** mode with downloadable prediction outputs
 
 ---
 
@@ -192,5 +198,12 @@ Output: [Normal, DDoS, Botnet] probabilities
 
 - **Traffic Simulation**: Samples real feature vectors from the CICIoT2023 test set (not synthetic), adds minimal Gaussian noise
 - **Sliding Window**: 10 consecutive flows form one classification input
-- **LLM Integration**: Ollama streaming API (NDJSON), background thread, non-blocking
+- **LLM Integration**: Gemini API (deployment) or Ollama NDJSON stream (local)
 - **Preprocessing**: MinMaxScaler, top-50 features by correlation → 38 after cleaning, stratified 70/15/15 split
+
+---
+
+## Deployment
+
+See full deployment instructions in DEPLOYMENT.md.
+For lightweight hosting, simulation uses data/processed/demo_pool.npz (compact sample pool) instead of full test arrays.

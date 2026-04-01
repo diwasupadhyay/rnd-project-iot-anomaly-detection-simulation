@@ -7,11 +7,13 @@ Run:  streamlit run dashboard/app.py
 
 import streamlit as st
 import numpy as np
+import pandas as pd
 import torch
 import sys, os, time, threading
 from datetime import datetime
 from collections import deque
 import plotly.graph_objects as go
+import joblib
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -26,6 +28,8 @@ from traffic_simulator import generate_normal, generate_ddos, generate_botnet, F
 from interpreter       import stream_attack_analysis
 
 MODEL_PATH = os.path.join(BASE_DIR, "models", "saved", "best_model.pth")
+FEAT_PATH  = os.path.join(BASE_DIR, "data", "processed", "feature_names.txt")
+SCALER_PATH = os.path.join(BASE_DIR, "data", "processed", "scaler.pkl")
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 WINDOW     = 10
 LABELS     = {0: "Normal", 1: "DDoS", 2: "Botnet"}
@@ -305,6 +309,19 @@ def load_model():
     return model
 
 
+@st.cache_resource
+def load_feature_names():
+    with open(FEAT_PATH, "r", encoding="utf-8") as f:
+        return f.read().splitlines()
+
+
+@st.cache_resource
+def load_scaler():
+    if os.path.exists(SCALER_PATH):
+        return joblib.load(SCALER_PATH)
+    return None
+
+
 @torch.no_grad()
 def predict(model, window):
     x     = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(DEVICE)
@@ -319,6 +336,49 @@ def get_flow(t):
     if t == "udp_flood": return generate_ddos(1, attack_type="udp_flood")[0]
     if t == "botnet":    return generate_botnet(1)[0]
     return generate_normal(1)[0]
+
+
+def _normalize_uploaded_features(df: pd.DataFrame, feature_names: list, scaler):
+    x = np.zeros((len(df), len(feature_names)), dtype=np.float32)
+    for i, feat in enumerate(feature_names):
+        if feat in df.columns:
+            x[:, i] = pd.to_numeric(df[feat], errors="coerce").fillna(0).values
+
+    # If values are not in expected normalized range, apply scaler when available.
+    if scaler is not None and (x.min() < -0.05 or x.max() > 1.05):
+        x = scaler.transform(x)
+
+    return np.clip(x, 0.0, 1.0).astype(np.float32)
+
+
+def run_csv_inference(df: pd.DataFrame, model, feature_names: list, scaler):
+    if len(df) < WINDOW:
+        raise ValueError(f"CSV must contain at least {WINDOW} rows for sliding-window inference.")
+
+    x = _normalize_uploaded_features(df, feature_names, scaler)
+
+    preds, confs, p_norm, p_ddos, p_bot = [], [], [], [], []
+    flow_ids = []
+    for i in range(WINDOW - 1, len(x)):
+        window = x[i - WINDOW + 1 : i + 1]
+        cls, conf, probs = predict(model, window)
+        preds.append(LABELS[cls])
+        confs.append(round(conf * 100, 2))
+        p_norm.append(round(float(probs[0]) * 100, 2))
+        p_ddos.append(round(float(probs[1]) * 100, 2))
+        p_bot.append(round(float(probs[2]) * 100, 2))
+        flow_ids.append(i + 1)
+
+    return pd.DataFrame(
+        {
+            "flow_idx": flow_ids,
+            "predicted_label": preds,
+            "confidence_pct": confs,
+            "prob_normal_pct": p_norm,
+            "prob_ddos_pct": p_ddos,
+            "prob_botnet_pct": p_bot,
+        }
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -337,8 +397,12 @@ def init():
         "current_phase": "Idle", "current_label": "Normal",
         "current_conf": 0.0, "current_probs": [1.0, 0.0, 0.0],
         "last_llm_label": None, "last_llm_flow": -999,
+        "last_llm_ts": 0.0,
         "health": 100.0,
         "sim_start": 0.0,
+        "csv_results": None,
+        "csv_file_name": "",
+        "csv_error": "",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -346,6 +410,8 @@ def init():
 
 init()
 model = load_model()
+feature_names = load_feature_names()
+scaler = load_scaler()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -353,76 +419,103 @@ model = load_model()
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("### 🛡️ IoT Anomaly Shield")
-    st.caption("CNN-LSTM · Ollama LLaMA 3.2:3b")
+    st.caption("CNN-LSTM · Gemini/Ollama")
     st.markdown("---")
 
-    # ── Scenario Timeline ──
-    st.markdown("**Scenario Timeline**")
-    for i, (t, dur, desc) in enumerate(SCENARIO):
-        icon = "🟢" if t == "normal" else ("🔴" if "flood" in t else "🟣")
-        idx  = st.session_state.scenario_idx
-        if st.session_state.running or st.session_state.done:
-            if i < idx:
-                cls_name = "done"
-            elif i == idx and st.session_state.running:
-                cls_name = "active"
+    source_mode = st.radio(
+        "Input Source",
+        options=["Live Simulation", "CSV Upload"],
+        index=0,
+        help="Use simulation for demo mode, or upload your own CSV for batch testing.",
+    )
+
+    st.markdown("---")
+    enable_llm = st.toggle("LLM Analysis", value=True)
+    llm_min_conf = st.slider("LLM min confidence %", 85, 99, 92, 1)
+    llm_cooldown = st.slider("LLM cooldown (sec)", 10, 180, 45, 5)
+    st.markdown("---")
+
+    if source_mode == "Live Simulation":
+        st.markdown("**Scenario Timeline**")
+        for i, (t, dur, desc) in enumerate(SCENARIO):
+            icon = "🟢" if t == "normal" else ("🔴" if "flood" in t else "🟣")
+            idx  = st.session_state.scenario_idx
+            if st.session_state.running or st.session_state.done:
+                if i < idx:
+                    cls_name = "done"
+                elif i == idx and st.session_state.running:
+                    cls_name = "active"
+                else:
+                    cls_name = "pending"
             else:
                 cls_name = "pending"
-        else:
-            cls_name = "pending"
-        st.markdown(
-            f'<div class="phase-item {cls_name}">{icon} {desc} <span style="margin-left:auto;font-size:11px;color:#6e7681">{dur}s</span></div>',
-            unsafe_allow_html=True,
-        )
+            st.markdown(
+                f'<div class="phase-item {cls_name}">{icon} {desc} <span style="margin-left:auto;font-size:11px;color:#6e7681">{dur}s</span></div>',
+                unsafe_allow_html=True,
+            )
 
-    st.markdown("---")
-    flow_speed = st.slider("Flow interval (s)", 0.1, 0.8, 0.3, 0.05)
-    enable_llm = st.toggle("🤖 LLM Analysis", value=True)
-    st.markdown("---")
+        st.markdown("---")
+        flow_speed = st.slider("Flow interval (s)", 0.1, 0.8, 0.3, 0.05)
+        st.markdown("---")
 
-    c1, c2 = st.columns(2)
-    start_btn = c1.button("▶ Start", use_container_width=True, type="primary",
-                           disabled=st.session_state.running)
-    stop_btn  = c2.button("⏹ Stop",  use_container_width=True,
-                           disabled=not st.session_state.running)
+        c1, c2 = st.columns(2)
+        start_btn = c1.button("▶ Start", use_container_width=True, type="primary",
+                               disabled=st.session_state.running)
+        stop_btn  = c2.button("⏹ Stop",  use_container_width=True,
+                               disabled=not st.session_state.running)
 
-    if start_btn:
-        ss = st.session_state
-        ss.history    = deque(maxlen=120)
-        ss.log_lines  = deque(maxlen=40)
-        ss.alerts     = []
-        ss.llm_cards  = []
-        ss.buffer     = []
-        ss.stats      = {"Normal": 0, "DDoS": 0, "Botnet": 0}
-        ss.flow_count = 0
-        ss.scenario_idx = 0
-        ss.phase_start  = time.time()
-        ss.sim_start    = time.time()
-        ss.current_phase = SCENARIO[0][2]
-        ss.current_label = "Normal"
-        ss.current_conf  = 0.0
-        ss.current_probs = [1.0, 0.0, 0.0]
-        ss.last_llm_label = None
-        ss.last_llm_flow  = -999
-        ss.health  = 100.0
-        ss.running = True
-        ss.done    = False
-        st.rerun()
+        if start_btn:
+            ss = st.session_state
+            ss.history    = deque(maxlen=120)
+            ss.log_lines  = deque(maxlen=40)
+            ss.alerts     = []
+            ss.llm_cards  = []
+            ss.buffer     = []
+            ss.stats      = {"Normal": 0, "DDoS": 0, "Botnet": 0}
+            ss.flow_count = 0
+            ss.scenario_idx = 0
+            ss.phase_start  = time.time()
+            ss.sim_start    = time.time()
+            ss.current_phase = SCENARIO[0][2]
+            ss.current_label = "Normal"
+            ss.current_conf  = 0.0
+            ss.current_probs = [1.0, 0.0, 0.0]
+            ss.last_llm_label = None
+            ss.last_llm_flow  = -999
+            ss.last_llm_ts    = 0.0
+            ss.health  = 100.0
+            ss.running = True
+            ss.done    = False
+            st.rerun()
 
-    if stop_btn:
+        if stop_btn:
+            st.session_state.running = False
+            st.rerun()
+
+        if st.session_state.running:
+            idx = st.session_state.scenario_idx
+            if idx < len(SCENARIO):
+                _, dur, _ = SCENARIO[idx]
+                elapsed = time.time() - st.session_state.phase_start
+                pct = min(elapsed / dur, 1.0)
+                remaining = max(0, dur - elapsed)
+                st.progress(pct)
+                st.caption(f"Phase {idx+1}/{len(SCENARIO)} · {remaining:.0f}s remaining")
+    else:
+        flow_speed = 0.3
         st.session_state.running = False
-        st.rerun()
-
-    # Phase progress
-    if st.session_state.running:
-        idx = st.session_state.scenario_idx
-        if idx < len(SCENARIO):
-            _, dur, desc = SCENARIO[idx]
-            elapsed = time.time() - st.session_state.phase_start
-            pct = min(elapsed / dur, 1.0)
-            remaining = max(0, dur - elapsed)
-            st.progress(pct)
-            st.caption(f"Phase {idx+1}/{len(SCENARIO)} · {remaining:.0f}s remaining")
+        uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+        run_csv = st.button("Run CSV Inference", use_container_width=True, type="primary")
+        if uploaded_file is not None and run_csv:
+            try:
+                df_up = pd.read_csv(uploaded_file)
+                results = run_csv_inference(df_up, model, feature_names, scaler)
+                st.session_state.csv_results = results
+                st.session_state.csv_file_name = uploaded_file.name
+                st.session_state.csv_error = ""
+            except Exception as e:
+                st.session_state.csv_results = None
+                st.session_state.csv_error = str(e)
 
     st.markdown("---")
     st.markdown(f"""
@@ -433,6 +526,45 @@ with st.sidebar:
     <b style="color:#8b949e">Model:</b> CNN-LSTM (218K params)
 </div>
 """, unsafe_allow_html=True)
+
+if source_mode == "CSV Upload":
+    st.markdown("## CSV Threat Testing")
+    st.caption("Upload traffic rows with model feature columns. Predictions start from row 10 due to sliding window.")
+
+    if st.session_state.csv_results is None:
+        if st.session_state.csv_error:
+            st.error(f"CSV processing failed: {st.session_state.csv_error}")
+        else:
+            st.info("Upload a CSV and click Run CSV Inference in the sidebar.")
+    else:
+        results_df = st.session_state.csv_results
+        total_rows = len(results_df)
+        counts = results_df["predicted_label"].value_counts().to_dict()
+        normal_n = counts.get("Normal", 0)
+        ddos_n = counts.get("DDoS", 0)
+        bot_n = counts.get("Botnet", 0)
+        avg_conf = results_df["confidence_pct"].mean() if total_rows else 0
+
+        a, b, c, d = st.columns(4)
+        a.metric("Predicted Flows", f"{total_rows}")
+        b.metric("Normal", f"{normal_n}")
+        c.metric("DDoS", f"{ddos_n}")
+        d.metric("Botnet", f"{bot_n}")
+
+        st.markdown(
+            f"File: {st.session_state.csv_file_name} | Mean confidence: {avg_conf:.2f}%"
+        )
+
+        st.dataframe(results_df, use_container_width=True, height=420)
+        st.download_button(
+            "Download Predictions CSV",
+            data=results_df.to_csv(index=False).encode("utf-8"),
+            file_name="prediction_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.stop()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -847,11 +979,14 @@ if st.session_state.running:
                 should_trigger = (
                     enable_llm
                     and not last_busy
+                    and (conf * 100 >= llm_min_conf)
+                    and ((time.time() - ss.last_llm_ts) >= llm_cooldown)
                     and (ss.last_llm_label != lbl or fc - ss.last_llm_flow >= 20)
                 )
                 if should_trigger:
                     ss.last_llm_label = lbl
                     ss.last_llm_flow  = fc
+                    ss.last_llm_ts    = time.time()
                     new_card = {
                         "label": lbl, "confidence": round(conf * 100, 1),
                         "flow": fc, "time": ts, "phase": phase_desc,

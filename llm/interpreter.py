@@ -1,15 +1,25 @@
 """
-llm/interpreter.py — Ollama LLM Interpreter
-=============================================
-Streams real-time attack analysis from a local LLaMA 3.2:3b model.
-Supports token-by-token streaming via Ollama's NDJSON API.
+llm/interpreter.py
+===================
+Provider-agnostic LLM interpreter for attack explanation.
+
+Supports:
+    - Ollama (local) for offline development
+    - Gemini API for deployment environments
+
+Environment variables:
+    LLM_PROVIDER=gemini|ollama   (default: gemini)
+    OLLAMA_URL=http://localhost:11434/api/generate
+    OLLAMA_MODEL=llama3.2:3b
+    GEMINI_API_KEY=...
+    GEMINI_MODEL=gemini-2.5-flash
 """
 
 import json
-import requests
+import os
+from typing import Generator
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.2:3b"
+import requests
 
 _CONTEXT = {
     "DDoS": {
@@ -26,11 +36,17 @@ _CONTEXT = {
     },
 }
 
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+
 
 def _build_prompt(attack_type: str, confidence: float,
                   prob_normal: float, prob_ddos: float, prob_botnet: float) -> str:
     ctx = _CONTEXT.get(attack_type, _CONTEXT["DDoS"])
-    return f"""You are a senior IoT network security analyst at a SOC. A CNN-LSTM anomaly detection model raised a real-time alert.
+    return f"""You are a senior SOC analyst for IoT networks. Keep response short and actionable.
 
 DETECTION REPORT:
   Attack    : {attack_type} ({ctx['desc']})
@@ -39,61 +55,108 @@ DETECTION REPORT:
   Indicators: {ctx['indicators']}
   Impact    : {ctx['impact']}
 
-Write a concise incident response. Use EXACTLY this format:
+Return at most 130 words. Use EXACTLY this format:
 
 THREAT ASSESSMENT:
-[2 sentences: what is happening and how severe it is]
+[max 2 short sentences]
 
 IMMEDIATE ACTIONS:
-1. [First containment step]
-2. [Second mitigation step]
-3. [Third protective measure]
+1. [containment]
+2. [mitigation]
+3. [monitoring]
 
 RECOMMENDATIONS:
-- [Infrastructure hardening]
-- [Monitoring improvement]
+- [hardening]
+- [prevention]
 
 SEVERITY: {ctx['severity']}"""
 
 
-_OPTS = {"temperature": 0.2, "num_predict": 280, "top_p": 0.85, "repeat_penalty": 1.15}
+_OPTS = {"temperature": 0.1, "num_predict": 180, "top_p": 0.8, "repeat_penalty": 1.15}
+
+
+def _chunk_text(text: str, chunk_size: int = 32) -> Generator[str, None, None]:
+    for i in range(0, len(text), chunk_size):
+        yield text[i:i + chunk_size]
+
+
+def _stream_from_ollama(prompt: str):
+    with requests.post(
+        OLLAMA_URL,
+        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True, "options": _OPTS},
+        stream=True,
+        timeout=90,
+    ) as r:
+        r.raise_for_status()
+        for raw_line in r.iter_lines():
+            if not raw_line:
+                continue
+            try:
+                chunk = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            token = chunk.get("response", "")
+            if token:
+                yield token
+            if chunk.get("done"):
+                break
+
+
+def _stream_from_gemini(prompt: str):
+    if not GEMINI_API_KEY:
+        yield (
+            "\nWARNING: Gemini key missing. Set GEMINI_API_KEY in environment.\n"
+            "Tip: For local mode you can switch to Ollama by setting LLM_PROVIDER=ollama."
+        )
+        return
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 220,
+            "topP": 0.8,
+        },
+    }
+    r = requests.post(url, json=payload, timeout=45)
+    r.raise_for_status()
+    data = r.json()
+
+    text = ""
+    candidates = data.get("candidates") or []
+    if candidates:
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts)
+
+    if not text.strip():
+        text = "No LLM response generated for this alert."
+
+    yield from _chunk_text(text.strip())
 
 
 def stream_attack_analysis(attack_type: str, confidence: float,
                            prob_normal: float, prob_ddos: float,
                            prob_botnet: float):
-    """Generator — yields text tokens one at a time as Ollama streams them."""
+    """Generator yielding text chunks for dashboard streaming UI."""
     prompt = _build_prompt(attack_type, confidence, prob_normal, prob_ddos, prob_botnet)
     try:
-        with requests.post(
-            OLLAMA_URL,
-            json={"model": MODEL_NAME, "prompt": prompt, "stream": True, "options": _OPTS},
-            stream=True, timeout=90,
-        ) as r:
-            r.raise_for_status()
-            for raw_line in r.iter_lines():
-                if not raw_line:
-                    continue
-                try:
-                    chunk = json.loads(raw_line)
-                except json.JSONDecodeError:
-                    continue
-                token = chunk.get("response", "")
-                if token:
-                    yield token
-                if chunk.get("done"):
-                    break
+        if LLM_PROVIDER == "ollama":
+            yield from _stream_from_ollama(prompt)
+        else:
+            yield from _stream_from_gemini(prompt)
     except requests.exceptions.ConnectionError:
         yield (
-            "\n⚠️  Cannot reach Ollama.\n\n"
-            "Start it:   ollama serve\n"
-            "Pull model: ollama pull llama3.2:3b\n\n"
-            "LLM will auto-retry on the next detected attack."
+            "\nWARNING: Cannot reach the configured LLM provider.\n"
+            "Check provider settings and network."
         )
     except requests.exceptions.Timeout:
-        yield "\n⚠️  Ollama timed out (90s). The model may be loading — next attack will retry."
+        yield "\nWARNING: LLM request timed out. Next alert will retry."
     except Exception as e:
-        yield f"\n⚠️  LLM error: {type(e).__name__}: {e}"
+        yield f"\nWARNING: LLM error: {type(e).__name__}: {e}"
 
 
 def get_attack_analysis(attack_type: str, confidence: float,
