@@ -24,8 +24,8 @@ sys.path.insert(0, os.path.join(BASE_DIR, "simulation"))
 sys.path.insert(0, os.path.join(BASE_DIR, "llm"))
 
 from cnn_lstm          import CNNLSTM
-from traffic_simulator import generate_normal, generate_ddos, generate_botnet, FEATURES
-from interpreter       import stream_attack_analysis
+from traffic_simulator import generate_normal, generate_ddos, generate_botnet, FEATURES, get_sample_dataframe
+from interpreter       import stream_attack_analysis, LLM_PROVIDER, GEMINI_MODEL, OLLAMA_MODEL
 
 MODEL_PATH = os.path.join(BASE_DIR, "models", "saved", "best_model.pth")
 FEAT_PATH  = os.path.join(BASE_DIR, "data", "processed", "feature_names.txt")
@@ -504,11 +504,26 @@ with st.sidebar:
     else:
         flow_speed = 0.3
         st.session_state.running = False
-        uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
-        run_csv = st.button("Run CSV Inference", use_container_width=True, type="primary")
+        st.markdown("**📂 Upload Traffic CSV**")
+        st.caption(f"CSV must contain these {len(feature_names)} feature columns (values 0–1, MinMax-scaled):")
+        with st.expander("📋 View required columns", expanded=False):
+            cols_text = ", ".join([f"`{f}`" for f in feature_names])
+            st.markdown(cols_text)
+        uploaded_file = st.file_uploader("Choose CSV file", type=["csv"], help="Min 10 rows required for sliding-window inference.")
+        c_run, c_sample = st.columns(2)
+        run_csv = c_run.button("🚀 Run Inference", use_container_width=True, type="primary", disabled=uploaded_file is None)
+        if c_sample.button("📥 Sample CSV", use_container_width=True):
+            sample_df = get_sample_dataframe(n_per_class=5)
+            st.session_state["_sample_csv"] = sample_df.to_csv(index=False).encode("utf-8")
+        if st.session_state.get("_sample_csv"):
+            st.download_button("⬇ Download sample.csv", data=st.session_state["_sample_csv"],
+                               file_name="sample_iot_traffic.csv", mime="text/csv", use_container_width=True)
         if uploaded_file is not None and run_csv:
             try:
                 df_up = pd.read_csv(uploaded_file)
+                missing = [f for f in feature_names if f not in df_up.columns]
+                if missing:
+                    st.warning(f"⚠️ {len(missing)} columns missing (will be zero-filled): {', '.join(missing[:8])}{'...' if len(missing)>8 else ''}")
                 results = run_csv_inference(df_up, model, feature_names, scaler)
                 st.session_state.csv_results = results
                 st.session_state.csv_file_name = uploaded_file.name
@@ -527,15 +542,85 @@ with st.sidebar:
 </div>
 """, unsafe_allow_html=True)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  METRIC CARD HELPER (defined early so CSV path can use it)
+# ═══════════════════════════════════════════════════════════════════════════════
+def mcard(col, icon, label, val, pct, color):
+    col.markdown(f"""
+<div class="m-card">
+    <div class="m-icon">{icon}</div>
+    <div class="m-label">{label}</div>
+    <div class="m-value">{val}</div>
+    <div class="m-bar"><div class="m-fill" style="width:{min(pct,100):.0f}%;background:{color}"></div></div>
+    <div class="m-pct" style="color:{color}">{pct:.1f}%</div>
+</div>""", unsafe_allow_html=True)
+
+
 if source_mode == "CSV Upload":
-    st.markdown("## CSV Threat Testing")
-    st.caption("Upload traffic rows with model feature columns. Predictions start from row 10 due to sliding window.")
+    st.markdown("""
+<div class="status-header safe">
+    <div class="pulse-dot pulse-green"></div>
+    <div style="flex:1">
+        <div style="color:#6e7681;font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px">
+            CSV Threat Testing
+        </div>
+        <div style="color:#58a6ff;font-size:22px;font-weight:700">Upload & Analyze Network Traffic</div>
+        <div style="color:#8b949e;font-size:13px;margin-top:2px">CNN-LSTM sliding-window inference on your own traffic data</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
     if st.session_state.csv_results is None:
         if st.session_state.csv_error:
             st.error(f"CSV processing failed: {st.session_state.csv_error}")
-        else:
-            st.info("Upload a CSV and click Run CSV Inference in the sidebar.")
+
+        # ── Data format guide ──
+        st.markdown('<div class="section-hdr">📖 Data Format Guide</div>', unsafe_allow_html=True)
+        guide_col1, guide_col2 = st.columns([3, 2])
+        with guide_col1:
+            st.markdown(f"""
+**Your CSV must include these {len(feature_names)} feature columns** (MinMax-scaled, values between 0 and 1).  
+Missing columns are auto-filled with 0. An optional `label` column is ignored during inference.
+
+| # | Feature Name | Description |
+|---|---|---|
+| 1 | `Variance` | Statistical variance of flow |
+| 2 | `ack_flag_number` | ACK flag count |
+| 3 | `Protocol Type` | Encoded protocol type |
+| 4 | `TCP` | TCP protocol indicator |
+| 5 | `syn_count` | SYN packet count |
+| 6 | `Duration` | Flow duration |
+| 7 | `Rate` | Packet rate |
+| 8 | `Header_Length` | Average header length |
+| ... | ... | ... |
+| 38 | `fin_flag_number` | FIN flag count |
+
+> ⚠️ **Minimum 10 rows** required (sliding window size = 10). Predictions start from row 10.
+""", unsafe_allow_html=False)
+        with guide_col2:
+            st.markdown("""
+**💡 Quick Tips:**
+- Values should be **0–1 normalized** (MinMax)
+- Raw CICIoT2023 data works — the scaler auto-applies
+- Click **📥 Sample CSV** in sidebar to get a working example
+- Download predictions as CSV after inference
+
+**Supported Traffic Classes:**
+- 🟢 **Normal** — Benign IoT traffic
+- 🔴 **DDoS** — SYN/UDP/ICMP floods
+- 🟣 **Botnet** — Mirai-variant infections
+""")
+
+        # ── Example data preview ──
+        st.markdown('<div class="section-hdr">📊 Example Data (first 5 columns)</div>', unsafe_allow_html=True)
+        try:
+            sample_df = get_sample_dataframe(n_per_class=3)
+            show_cols = feature_names[:5] + ["label"]
+            show_cols = [c for c in show_cols if c in sample_df.columns]
+            st.dataframe(sample_df[show_cols], use_container_width=True, height=180)
+            st.caption(f"Showing 5 of {len(feature_names)} feature columns. Download the full sample CSV from sidebar.")
+        except Exception:
+            st.info("Upload a CSV and click 🚀 Run Inference in the sidebar to analyze.")
     else:
         results_df = st.session_state.csv_results
         total_rows = len(results_df)
@@ -546,18 +631,34 @@ if source_mode == "CSV Upload":
         avg_conf = results_df["confidence_pct"].mean() if total_rows else 0
 
         a, b, c, d = st.columns(4)
-        a.metric("Predicted Flows", f"{total_rows}")
-        b.metric("Normal", f"{normal_n}")
-        c.metric("DDoS", f"{ddos_n}")
-        d.metric("Botnet", f"{bot_n}")
+        mcard(a, "📊", "Predicted Flows", total_rows, 100, "#58a6ff")
+        mcard(b, "🟢", "Normal", normal_n, normal_n / max(total_rows, 1) * 100, "#3fb950")
+        mcard(c, "🔴", "DDoS", ddos_n, ddos_n / max(total_rows, 1) * 100, "#f85149")
+        mcard(d, "🟣", "Botnet", bot_n, bot_n / max(total_rows, 1) * 100, "#a371f7")
 
         st.markdown(
-            f"File: {st.session_state.csv_file_name} | Mean confidence: {avg_conf:.2f}%"
+            f"**File:** `{st.session_state.csv_file_name}` &nbsp;|&nbsp; **Mean confidence:** {avg_conf:.2f}%"
         )
 
-        st.dataframe(results_df, use_container_width=True, height=420)
+        # Confidence distribution chart
+        if total_rows > 0:
+            import plotly.express as px
+            fig_dist = px.histogram(
+                results_df, x="confidence_pct", color="predicted_label",
+                color_discrete_map={"Normal": "#3fb950", "DDoS": "#f85149", "Botnet": "#a371f7"},
+                nbins=30, title="Confidence Distribution",
+                labels={"confidence_pct": "Confidence %", "predicted_label": "Class"},
+            )
+            fig_dist.update_layout(
+                height=250, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="#010409",
+                font=dict(color="#8b949e", size=11), margin=dict(l=40, r=12, t=40, b=30),
+                xaxis=dict(gridcolor="#21262d"), yaxis=dict(gridcolor="#21262d"),
+            )
+            st.plotly_chart(fig_dist, use_container_width=True)
+
+        st.dataframe(results_df, use_container_width=True, height=400)
         st.download_button(
-            "Download Predictions CSV",
+            "⬇️ Download Predictions CSV",
             data=results_df.to_csv(index=False).encode("utf-8"),
             file_name="prediction_results.csv",
             mime="text/csv",
@@ -637,16 +738,6 @@ _h_color = "#3fb950" if health > 70 else ("#d29922" if health > 30 else "#f85149
 _h_label = "Healthy" if health > 70 else ("Degraded" if health > 30 else "Critical")
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-
-def mcard(col, icon, label, val, pct, color):
-    col.markdown(f"""
-<div class="m-card">
-    <div class="m-icon">{icon}</div>
-    <div class="m-label">{label}</div>
-    <div class="m-value">{val}</div>
-    <div class="m-bar"><div class="m-fill" style="width:{min(pct,100):.0f}%;background:{color}"></div></div>
-    <div class="m-pct" style="color:{color}">{pct:.1f}%</div>
-</div>""", unsafe_allow_html=True)
 
 mcard(c1, "📊", "Total Flows",   total if total > 1 else 0, 100, "#58a6ff")
 mcard(c2, "🟢", "Normal",  stats["Normal"],  stats["Normal"]/total*100,  "#3fb950")
@@ -801,7 +892,7 @@ else:
                 if _pending:
                     st.markdown(f"""
 <div class="llm-pending" style="border-left:3px solid {_c_color}">
-    <div style="color:#58a6ff;font-size:13px;margin-bottom:4px">⏳ Connecting to LLaMA 3.2:3b...</div>
+    <div style="color:#58a6ff;font-size:13px;margin-bottom:4px">⏳ Connecting to {GEMINI_MODEL if LLM_PROVIDER == 'gemini' else OLLAMA_MODEL}...</div>
     <div style="color:#6e7681;font-size:12px">Simulation continues — response streams live</div>
 </div>""", unsafe_allow_html=True)
                 else:
